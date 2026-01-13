@@ -1,18 +1,20 @@
 use std::io::Seek;
-use std::{io::Read, mem::size_of, sync::Arc, time::Duration};
+use std::{ io::Read, mem::size_of, sync::Arc, time::Duration };
 use byte_slice_cast::AsByteSlice;
 use serde::Deserialize;
 use serenity::prelude::GatewayIntents;
-use songbird::input::reader::MediaSource;
-use tsclientlib::{ClientId, Connection, DisconnectOptions, Identity, StreamItem};
-use tsproto_packets::packets::{AudioData, CodecType, OutAudio, OutPacket};
+use tsclientlib::{ ClientId, Connection, DisconnectOptions, Identity, StreamItem };
+use tsproto_packets::packets::{ AudioData, CodecType, OutAudio, OutPacket };
 use audiopus::coder::Encoder;
 use futures::prelude::*;
-use slog::{debug, o, Drain, Logger};
+use slog::{ debug, o, Drain, Logger };
 use tokio::task;
 use tokio::sync::Mutex;
-use anyhow::{bail,Result};
-
+use anyhow::{ bail, Result };
+use symphonia::core::io::MediaSource;
+use rustls::crypto::CryptoProvider;
+use std::collections::VecDeque;
+use std::sync::Mutex as StdMutex; // Rename std mutex
 mod discord;
 mod discord_audiohandler;
 
@@ -22,31 +24,24 @@ struct ConnectionId(u64);
 // This trait adds the `register_songbird` and `register_songbird_with` methods
 // to the client builder below, making it easy to install this voice client.
 // The voice client can be retrieved in any command using `songbird::get(ctx).await`.
-use songbird::{SerenityInit, Songbird};
-use songbird::driver::{DecodeMode};
+use songbird::{ SerenityInit, Songbird };
 use songbird::Config as DriverConfig;
 
 // Import the `Context` to handle commands.
-use serenity::{prelude::{TypeMapKey}};
+use serenity::{ prelude::{ TypeMapKey } };
 
-use serenity::{
-    client::{Client},
-    framework::{
-        StandardFramework,
-    },
-};
+use serenity::{ client::{ Client }, framework::{ StandardFramework } };
 
-
-#[derive(Debug,Deserialize)]
+#[derive(Debug, Deserialize)]
 struct Config {
     discord_token: String,
     teamspeak_server: String,
     teamspeak_identity: String,
-	teamspeak_server_password: Option<String>,
+    teamspeak_server_password: Option<String>,
     teamspeak_channel_id: Option<u64>,
-	teamspeak_channel_name: Option<String>,
-	teamspeak_channel_password: Option<String>,
-	teamspeak_name: Option<String>,
+    teamspeak_channel_name: Option<String>,
+    teamspeak_channel_password: Option<String>,
+    teamspeak_name: Option<String>,
     /// default 0
     verbose: i32,
     /// default 1.0
@@ -58,16 +53,158 @@ struct ListenerHolder;
 //TODO: stop shooting myself in the knee with a mutex
 type AudioBufferDiscord = Arc<Mutex<discord_audiohandler::AudioHandler<u32>>>;
 
-
 type TsVoiceId = (ConnectionId, ClientId);
 type TsAudioHandler = tsclientlib::audio::AudioHandler<TsVoiceId>;
 
 #[derive(Clone)]
 struct TsToDiscordPipeline {
-	data: Arc<std::sync::Mutex<TsAudioHandler>>,
+    data: Arc<std::sync::Mutex<TsAudioHandler>>,
+}
+
+impl Seek for TsToDiscordPipeline {
+    fn seek(&mut self, _: std::io::SeekFrom) -> std::io::Result<u64> {
+        Err(std::io::Error::new(std::io::ErrorKind::Other, "source does not support seeking"))
+    }
 }
 
 impl MediaSource for TsToDiscordPipeline {
+    fn is_seekable(&self) -> bool {
+        false // Your audio stream is not seekable
+    }
+
+    fn byte_len(&self) -> Option<u64> {
+        None // Unknown length for a live stream
+    }
+}
+
+impl TsToDiscordPipeline {
+    pub fn new(logger: Logger) -> Self {
+        Self {
+            data: Arc::new(std::sync::Mutex::new(TsAudioHandler::new(logger))),
+        }
+    }
+}
+
+impl Read for TsToDiscordPipeline {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let samples_requested = buf.len() / size_of::<f32>();
+        let mut audio_buffer: Vec<f32> = vec![0.0; samples_requested];
+
+        // Single lock, single fill - no chunking
+        {
+            let mut lock = self.data.lock().expect("Can't lock ts voice buffer!");
+            lock.fill_buffer(&mut audio_buffer);
+        }
+
+        // Debug logging
+        let max_sample = audio_buffer
+            .iter()
+            .map(|s| s.abs())
+            .fold(0.0f32, f32::max);
+        if max_sample > 0.001 {
+            eprintln!(
+                "TS→Discord: max sample: {:.4}, samples requested: {}",
+                max_sample,
+                samples_requested
+            );
+        }
+
+        // Apply gain
+        const GAIN: f32 = 3.0;
+        for sample in &mut audio_buffer {
+            *sample *= GAIN;
+            *sample = sample.clamp(-1.0, 1.0);
+        }
+
+        let slice = audio_buffer.as_byte_slice();
+        buf.copy_from_slice(slice);
+
+        Ok(buf.len())
+    }
+}
+
+impl TypeMapKey for ListenerHolder {
+    type Value = (TsToDiscordPipeline, AudioBufferDiscord);
+}
+
+struct BufferedPipeline {
+    inner: TsToDiscordPipeline,
+    buffer: Arc<StdMutex<VecDeque<u8>>>,
+}
+
+impl BufferedPipeline {
+    fn new(inner: TsToDiscordPipeline) -> Self {
+        Self {
+            inner,
+            buffer: Arc::new(StdMutex::new(VecDeque::with_capacity(32768))),
+        }
+    }
+
+    // Background task to continuously fill the buffer
+    fn start_filler(&self) {
+        let inner = self.inner.clone();
+        let buffer = self.buffer.clone();
+
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_millis(20));
+            loop {
+                interval.tick().await;
+
+                // Read 1920 samples (20ms of stereo audio) every 20ms
+                let mut temp_buf = vec![0u8; 1920 * 4]; // 1920 samples * 4 bytes per f32
+
+                // Use a blocking read operation
+                let n = {
+                    let mut reader = inner.clone();
+                    match std::io::Read::read(&mut reader, &mut temp_buf) {
+                        Ok(n) => n,
+                        Err(e) => {
+                            eprintln!("Buffer filler read error: {}", e);
+                            continue;
+                        }
+                    }
+                };
+
+                if n > 0 {
+                    let mut buf_lock = buffer.lock().unwrap();
+                    buf_lock.extend(&temp_buf[..n]);
+
+                    // Keep buffer size reasonable (max 1 second)
+                    while buf_lock.len() > 48000 * 2 * 4 {
+                        buf_lock.drain(..1920 * 4);
+                    }
+                }
+            }
+        });
+    }
+}
+
+impl Read for BufferedPipeline {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let mut buffer_lock = self.buffer.lock().unwrap();
+        let available = buffer_lock.len().min(buf.len());
+
+        for i in 0..available {
+            buf[i] = buffer_lock.pop_front().unwrap();
+        }
+
+        // If no data available, return silence
+        if available == 0 {
+            buf.fill(0);
+            return Ok(buf.len());
+        }
+
+        Ok(available)
+    }
+}
+
+impl Seek for BufferedPipeline {
+    fn seek(&mut self, _: std::io::SeekFrom) -> std::io::Result<u64> {
+        Err(std::io::Error::new(std::io::ErrorKind::Other, "source does not support seeking"))
+    }
+}
+
+impl MediaSource for BufferedPipeline {
     fn is_seekable(&self) -> bool {
         false
     }
@@ -77,41 +214,13 @@ impl MediaSource for TsToDiscordPipeline {
     }
 }
 
-impl Seek for TsToDiscordPipeline {
-    fn seek(&mut self, _: std::io::SeekFrom) -> std::io::Result<u64> {
-        Err(std::io::Error::new(std::io::ErrorKind::Other, "source does not support seeking"))
+impl Clone for BufferedPipeline {
+    fn clone(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+            buffer: self.buffer.clone(),
+        }
     }
-}
-
-impl TsToDiscordPipeline {
-	pub fn new(logger: Logger) -> Self {
-		Self {
-			data: Arc::new(std::sync::Mutex::new(TsAudioHandler::new(logger)))
-		}
-	}
-}
-
-impl Read for TsToDiscordPipeline {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-		let len = buf.len() / size_of::<f32>();
-		let mut wtr: Vec<f32> = vec![0.0; len];
-		// TODO: can't we support async read for songbird ? this is kinda bad as it requires a sync mutex
-		{
-			let mut lock = self.data.lock().expect("Can't lock ts voice buffer!");
-
-			// and this is really ugly.. read only works for u8, but we get an f32 and need to convert that without changing AudioHandlers API
-			// also Read for stuff that specifies to use f32 is kinda meh			
-			lock.fill_buffer(wtr.as_mut_slice());
-		}
-		let slice = wtr.as_byte_slice();
-		buf.copy_from_slice(slice);
-
-		Ok(buf.len())
-    }
-}
-
-impl TypeMapKey for ListenerHolder {
-    type Value = (TsToDiscordPipeline,AudioBufferDiscord);
 }
 
 /// teamspeak audio fragment timer
@@ -119,157 +228,167 @@ impl TypeMapKey for ListenerHolder {
 const TICK_TIME: u64 = 20;
 const FRAME_SIZE_MS: usize = 20;
 const SAMPLE_RATE: usize = 48000;
-const STEREO_20MS: usize = SAMPLE_RATE * 2 * FRAME_SIZE_MS / 1000;
+const STEREO_20MS: usize = (SAMPLE_RATE * 2 * FRAME_SIZE_MS) / 1000;
 /// The maximum size of an opus frame is 1275 as from RFC6716.
 const MAX_OPUS_FRAME_SIZE: usize = 1275;
 
 const RUST_LOG: &'static str = "RUST_LOG";
 #[tokio::main]
 async fn main() -> Result<()> {
-	if std::env::var(RUST_LOG).is_err() {
+    // Install the ring crypto provider for rustls before anything else
+    rustls::crypto::ring
+        ::default_provider()
+        .install_default()
+        .expect("Failed to install rustls crypto provider");
+    if std::env::var(RUST_LOG).is_err() {
         std::env::set_var(
             RUST_LOG,
-            #[cfg(debug_assertions)]
-            "info,voice_bridge=debug",
-            #[cfg(not(debug_assertions))]
-            "warn,voice_bridge=info",
+            #[cfg(debug_assertions)] "info,voice_bridge=debug",
+            #[cfg(not(debug_assertions))] "warn,voice_bridge=info"
         );
     }
     tracing_subscriber::fmt::init();
-	// init logging stuff used by tsclientlib
-    let config: Config = toml::from_str(&std::fs::read_to_string(".credentials.toml").expect("No config file!")).expect("Invalid config");
+    // init logging stuff used by tsclientlib
+    let config: Config = toml
+        ::from_str(&std::fs::read_to_string(".credentials.toml").expect("No config file!"))
+        .expect("Invalid config");
     let logger = {
-		let decorator = slog_term::TermDecorator::new().build();
-		let drain = slog_term::CompactFormat::new(decorator).build().fuse();
-		let drain = slog_envlogger::new(drain).fuse();
-		let drain = slog_async::Async::new(drain).build().fuse();
+        let decorator = slog_term::TermDecorator::new().build();
+        let drain = slog_term::CompactFormat::new(decorator).build().fuse();
+        let drain = slog_envlogger::new(drain).fuse();
+        let drain = slog_async::Async::new(drain).build().fuse();
 
-		Logger::root(drain, o!())
-	};
+        Logger::root(drain, o!())
+    };
     // init discord framework
-    let framework = StandardFramework::new()
-        .configure(|c| c
-                   .prefix("~"))
-        .group(&discord::GENERAL_GROUP);
+    let framework = StandardFramework::new();
+    let framework = framework.group(&discord::GENERAL_GROUP);
 
-	// Here, we need to configure Songbird to decode all incoming voice packets.
+    // Here, we need to configure Songbird to decode all incoming voice packets.
     // If you want, you can do this on a per-call basis---here, we need it to
     // read the audio data that other people are sending us!
     let songbird = Songbird::serenity();
-    songbird.set_config(
-        DriverConfig::default()
-            .decode_mode(DecodeMode::Decrypt)
-    );
+    songbird.set_config(DriverConfig::default().decode_mode(songbird::driver::DecodeMode::Decode));
 
-	let intents = GatewayIntents::GUILD_MESSAGES
-        | GatewayIntents::MESSAGE_CONTENT
-		| GatewayIntents::GUILD_VOICE_STATES;
+    let intents =
+        GatewayIntents::GUILD_MESSAGES |
+        GatewayIntents::MESSAGE_CONTENT |
+        GatewayIntents::GUILD_VOICE_STATES;
 
-	// init discord client
+    // init discord client
     let mut client = Client::builder(&config.discord_token, intents)
         .event_handler(discord::Handler)
         .framework(framework)
-        .register_songbird_with(songbird.into())
-        .await
+        .register_songbird_with(songbird.into()).await
         .expect("Err creating client");
 
-	// init teamspeak -> discord pipeline
-	let ts_voice_logger = logger.new(o!("pipeline" => "voice-ts"));
-	let teamspeak_voice_handler = TsToDiscordPipeline::new(ts_voice_logger);
+    // init teamspeak -> discord pipeline
+    let ts_voice_logger = logger.new(o!("pipeline" => "voice-ts"));
+    let teamspeak_voice_handler = TsToDiscordPipeline::new(ts_voice_logger);
 
-	// init discord -> teamspeak pipeline
-	let discord_voice_logger = logger.new(o!("pipeline" => "voice-discord"));
-	let discord_voice_buffer: AudioBufferDiscord = Arc::new(Mutex::new(discord_audiohandler::AudioHandler::new(discord_voice_logger)));
-	// stuff discord -> teamspeak pipeline into discord context for retrieval inside the client
-	{
-		// Open the data lock in write mode, so keys can be inserted to it.
-		let mut data = client.data.write().await;
+    // init discord -> teamspeak pipeline
+    let discord_voice_logger = logger.new(o!("pipeline" => "voice-discord"));
+    let discord_voice_buffer: AudioBufferDiscord = Arc::new(
+        Mutex::new(discord_audiohandler::AudioHandler::new(discord_voice_logger))
+    );
+    // stuff discord -> teamspeak pipeline into discord context for retrieval inside the client
+    {
+        // Open the data lock in write mode, so keys can be inserted to it.
+        let mut data = client.data.write().await;
 
-		// The CommandCounter Value has the following type:
-		// Arc<RwLock<HashMap<String, u64>>>
-		// So, we have to insert the same type to it.
-		data.insert::<ListenerHolder>((teamspeak_voice_handler.clone(),discord_voice_buffer.clone()));
-	}
+        // The CommandCounter Value has the following type:
+        // Arc<RwLock<HashMap<String, u64>>>
+        // So, we have to insert the same type to it.
+        data.insert::<ListenerHolder>((
+            teamspeak_voice_handler.clone(),
+            discord_voice_buffer.clone(),
+        ));
+    }
 
-	// spawn client runner
+    // spawn client runner
     tokio::spawn(async move {
         let _ = client.start().await.map_err(|why| println!("Client ended: {:?}", why));
     });
 
     let con_id = ConnectionId(0);
 
-	// configure teamspeak client
-	let mut con_config = Connection::build(config.teamspeak_server)
-		.log_commands(config.verbose >= 1)
-		.log_packets(config.verbose >= 2)
-		.log_udp_packets(config.verbose >= 3);
+    // configure teamspeak client
+    let mut con_config = Connection::build(config.teamspeak_server)
+        .log_commands(config.verbose >= 1)
+        .log_packets(config.verbose >= 2)
+        .log_udp_packets(config.verbose >= 3);
 
-	if let Some(name) = config.teamspeak_name {
-		con_config = con_config.name(name);
-	}
-	if let Some(channel) = config.teamspeak_channel_id {
-		con_config = con_config.channel_id(tsclientlib::ChannelId(channel));
-	}
-	if let Some(channel) = config.teamspeak_channel_name {
-		con_config = con_config.channel(channel);
-	}
-	if let Some(password) = config.teamspeak_server_password {
-		con_config = con_config.password(password);
-	}
-	if let Some(password) = config.teamspeak_channel_password {
-		con_config = con_config.channel_password(password);
-	}
+    if let Some(name) = config.teamspeak_name {
+        con_config = con_config.name(name);
+    }
+    if let Some(channel) = config.teamspeak_channel_id {
+        con_config = con_config.channel_id(tsclientlib::ChannelId(channel));
+    }
+    if let Some(channel) = config.teamspeak_channel_name {
+        con_config = con_config.channel(channel);
+    }
+    if let Some(password) = config.teamspeak_server_password {
+        con_config = con_config.password(password);
+    }
+    if let Some(password) = config.teamspeak_channel_password {
+        con_config = con_config.channel_password(password);
+    }
 
-	// teamspeak: Optionally set the key of this client, otherwise a new key is generated.
-	let id = Identity::new_from_str(&config.teamspeak_identity).expect("Can't load identity!");
-	let con_config = con_config.identity(id);
+    // teamspeak: Optionally set the key of this client, otherwise a new key is generated.
+    let id = Identity::new_from_str(&config.teamspeak_identity).expect("Can't load identity!");
+    let con_config = con_config.identity(id);
 
-	// Connect teamspeak client
-	let mut con = con_config.connect()?;
+    // Connect teamspeak client
+    let mut con = con_config.connect()?;
 
-	// todo: something something discord connection events?
-	let r = con
-		.events()
-		.try_filter(|e| future::ready(matches!(e, StreamItem::BookEvents(_))))
-		.next()
-		.await;
-	if let Some(r) = r {
-		r?;
-	}
+    // todo: something something discord connection events?
+    let r = con
+        .events()
+        .try_filter(|e| future::ready(matches!(e, StreamItem::BookEvents(_))))
+        .next().await;
+    if let Some(r) = r {
+        r?;
+    }
 
-	// init discord -> teamspeak opus encoder
-	let encoder = audiopus::coder::Encoder::new(
-		audiopus::SampleRate::Hz48000,
-		audiopus::Channels::Stereo,
-		audiopus::Application::Voip)
-		.expect("Can't construct encoder!");
-	// we have to stuff this inside an arc-mutex to avoid lifetime shenanigans
-	let encoder = Arc::new(Mutex::new(encoder));
+    // init discord -> teamspeak opus encoder
+    let encoder = audiopus::coder::Encoder
+        ::new(
+            audiopus::SampleRate::Hz48000,
+            audiopus::Channels::Stereo,
+            audiopus::Application::Voip
+        )
+        .expect("Can't construct encoder!");
+    // we have to stuff this inside an arc-mutex to avoid lifetime shenanigans
+    let encoder = Arc::new(Mutex::new(encoder));
 
-	// teamspeak playback timer
-	let mut interval = tokio::time::interval(Duration::from_millis(TICK_TIME));
-	
-	loop {
-		// handle teamspeak events
-		let events = con.events().try_for_each(|e| async {
-			// handle teamspeak audio packets
-			if let StreamItem::Audio(packet) = e {
-				let from = ClientId(match packet.data().data() {
-					AudioData::S2C { from, .. } => *from,
-					AudioData::S2CWhisper { from, .. } => *from,
-					_ => panic!("Can only handle S2C packets but got a C2S packet"),
-				});
-				
-				let mut ts_voice: std::sync::MutexGuard<TsAudioHandler> = teamspeak_voice_handler.data.lock().expect("Can't lock ts audio buffer!");
-				// feed mixer+jitter buffer, consumed by discord
-				if let Err(e) = ts_voice.handle_packet((con_id, from), packet) {
-					debug!(logger, "Failed to handle TS_Voice packet"; "error" => %e);
-				}
-			}
-			Ok(())
-		});
-		// Wait for ctrl + c and run everything else, end on who ever stops first
-		tokio::select! {
+    // teamspeak playback timer
+    let mut interval = tokio::time::interval(Duration::from_millis(TICK_TIME));
+
+    loop {
+        // handle teamspeak events
+        let events = con.events().try_for_each(|e| async {
+            // handle teamspeak audio packets
+            if let StreamItem::Audio(packet) = e {
+                let from = ClientId(match packet.data().data() {
+                    AudioData::S2C { from, .. } => *from,
+                    AudioData::S2CWhisper { from, .. } => *from,
+                    _ => panic!("Can only handle S2C packets but got a C2S packet"),
+                });
+
+                // DEBUG: Log packet arrivals (without sequence number)
+                eprintln!("TS packet: client {:?}", from.0);
+
+                let mut ts_voice = teamspeak_voice_handler.data
+                    .lock()
+                    .expect("Can't lock ts audio buffer!");
+                if let Err(e) = ts_voice.handle_packet((con_id, from), packet) {
+                    debug!(logger, "Failed to handle TS_Voice packet"; "error" => %e);
+                }
+            }
+            Ok(())
+        });
+        // Wait for ctrl + c and run everything else, end on who ever stops first
+        tokio::select! {
 			_send = interval.tick() => {
 				let start = std::time::Instant::now();
 				// send audio frame to teamspeak
@@ -286,52 +405,67 @@ async fn main() -> Result<()> {
 				r?;
 				bail!("Disconnected");
 			}
-		};
-	}
-	println!("Disconnecting");
-	// Disconnect
-	con.disconnect(DisconnectOptions::new())?;
-	con.events().for_each(|_| future::ready(())).await;
-	println!("Disconnected");
+		}
+    }
+    println!("Disconnecting");
+    // Disconnect
+    con.disconnect(DisconnectOptions::new())?;
+    con.events().for_each(|_| future::ready(())).await;
+    println!("Disconnected");
     Ok(())
 }
 
-
 /// Create an audio frame for consumption by teamspeak.
 /// Merges all streams and converts them to opus
-async fn process_discord_audio(voice_buffer: &AudioBufferDiscord, encoder: &Arc<Mutex<Encoder>>) -> Option<OutPacket> {
-	// let mut buffer_map;
-	// {
-	// 	let mut lock = voice_buffer.lock().await;
-	// 	buffer_map = std::mem::replace(&mut *lock, HashMap::new());
-	// }
+async fn process_discord_audio(
+    voice_buffer: &AudioBufferDiscord,
+    encoder: &Arc<Mutex<Encoder>>
+) -> Option<OutPacket> {
+    // let mut buffer_map;
+    // {
+    // 	let mut lock = voice_buffer.lock().await;
+    // 	buffer_map = std::mem::replace(&mut *lock, HashMap::new());
+    // }
 
-	let mut data = [0.0; STEREO_20MS];
-	{
-		let mut lock = voice_buffer.lock().await;
-		lock.fill_buffer(&mut data);
-	}
-	let mut encoded = [0; MAX_OPUS_FRAME_SIZE];
-	let encoder_c = encoder.clone();
-	// don't block the async runtime
-	let res = task::spawn_blocking(move || {
-		let start = std::time::Instant::now();		
-		// encode back to opus
-		// this should never block, thus we don't fail gracefully for it
-		let lock = encoder_c.try_lock().expect("Can't reach encoder!");
-		let length = match lock.encode_float(&data, &mut encoded) {
-			Err(e) => {eprintln!("Failed to encode voice: {}",e); return None;},
-			Ok(size) => size,
-		};
-		//println!("Data size: {}/{} enc-length: {}",data.len(),STEREO_20MS,length);
-		//println!("length size: {}",length);
-		// warn on high encoding times
-		let duration = start.elapsed().as_millis();
-		if duration > 2 {
-			eprintln!("Took too {}ms for processing audio!",duration);
-		}
-		// package into teamspeak audio structure
-		Some(OutAudio::new(&AudioData::C2S { id: 0, codec: CodecType::OpusMusic, data: &encoded[..length] }))
-	}).await.expect("Join error for audio processing thread!");
-	res
+    let mut data = [0.0; STEREO_20MS];
+    {
+        let mut lock = voice_buffer.lock().await;
+        lock.fill_buffer(&mut data);
+    }
+    let mut encoded = [0; MAX_OPUS_FRAME_SIZE];
+    let encoder_c = encoder.clone();
+    // don't block the async runtime
+    let res = task
+        ::spawn_blocking(move || {
+            let start = std::time::Instant::now();
+            // encode back to opus
+            // this should never block, thus we don't fail gracefully for it
+            let lock = encoder_c.try_lock().expect("Can't reach encoder!");
+            let length = match lock.encode_float(&data, &mut encoded) {
+                Err(e) => {
+                    eprintln!("Failed to encode voice: {}", e);
+                    return None;
+                }
+                Ok(size) => size,
+            };
+            //println!("Data size: {}/{} enc-length: {}",data.len(),STEREO_20MS,length);
+            //println!("length size: {}",length);
+            // warn on high encoding times
+            let duration = start.elapsed().as_millis();
+            if duration > 2 {
+                eprintln!("Took too {}ms for processing audio!", duration);
+            }
+            // package into teamspeak audio structure
+            Some(
+                OutAudio::new(
+                    &(AudioData::C2S {
+                        id: 0,
+                        codec: CodecType::OpusMusic,
+                        data: &encoded[..length],
+                    })
+                )
+            )
+        }).await
+        .expect("Join error for audio processing thread!");
+    res
 }
