@@ -19,6 +19,9 @@ lto = true
 [dependencies]
 toml = "0.7"
 serde = { version = "1.0", features = ["derive"] }
+rustls = { version = "0.23", features = ["ring"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+symphonia = { version = "0.5", features = [] }
 
 # pushing [f32] to [u8] and vice verca
 byte-slice-cast = "1"
@@ -56,11 +59,11 @@ version = "0.2"
 ## discord specific
 
 [dependencies.songbird]
-version = "0.3"
-features = ["driver","gateway"]
+version = "0.5"
+features = ["driver","gateway", "receive"]
 
 [dependencies.serenity]
-version = "0.11"
+version = "0.12"
 features = ["client", "standard_framework", "voice","native_tls_backend", "builder"]
 
 ## tokio

@@ -1,43 +1,25 @@
 //! Discord handler
-
 use anyhow::bail;
-use serenity::builder::CreateApplicationCommand;
-use serenity::model::application::command::Command;
-use serenity::model::prelude::command::CommandOptionType;
-use serenity::model::application::interaction::{Interaction, InteractionResponseType};
-use serenity::model::id::GuildId;
-use serenity::model::prelude::interaction::application_command::{CommandDataOption, CommandDataOptionValue, ApplicationCommandInteraction};
-// This trait adds the `register_songbird` and `register_songbird_with` methods
-// to the client builder below, making it easy to install this voice client.
-// The voice client can be retrieved in any command using `songbird::get(ctx).await`.
-use songbird::input::Input;
-
-use serenity::prelude::*;
-
-// Import the `Context` to handle commands.
-use serenity::client::Context;
-
-use serenity::{
-    async_trait,
-    client::{EventHandler},
-    framework::{
-        standard::{
-            Args, CommandResult,
-            macros::{command, group},
-        },
-    },
-    model::{channel::Message, gateway::Ready},
-    Result as SerenityResult,
+use serenity::async_trait;
+use serenity::all::{
+    Command, CommandInteraction, CommandOptionType, CommandDataOptionValue,
+    CreateCommand, CreateCommandOption, CreateInteractionResponse,
+    CreateInteractionResponseMessage, EditInteractionResponse,
+    Context, EventHandler, Interaction, Message, Ready,
 };
-use songbird::packet::PacketSize;
-use songbird::packet::rtp::RtpExtensionPacket;
-use songbird::{
-    model::payload::{ClientDisconnect, Speaking},
-    CoreEvent,
-    Event,
-    EventContext,
-    EventHandler as VoiceEventHandler,
+use serenity::framework::standard::{
+    Args, CommandResult,
+    macros::{command, group},
 };
+use serenity::Result as SerenityResult;
+use std::sync::Arc;
+use std::io::Read;
+
+// Songbird imports
+use songbird::input::{Input, RawAdapter, Compose};
+use songbird::events::EventContext;
+use songbird::{Event, EventHandler as VoiceEventHandler};
+use songbird::events::CoreEvent;
 
 use crate::ListenerHolder;
 
@@ -46,7 +28,7 @@ pub(crate) struct Handler;
 #[async_trait]
 impl EventHandler for Handler {
     async fn interaction_create(&self, ctx: Context, interaction: Interaction) {
-        if let Interaction::ApplicationCommand(command) = interaction {
+        if let Interaction::Command(command) = interaction {
             println!("Received command interaction: {:#?}", command);
             let result: Result<(), anyhow::Error> = match command.data.name.as_str() {
                 "join_voice" => handle_join(&ctx,&command).await,
@@ -55,20 +37,17 @@ impl EventHandler for Handler {
 
             if let Err(err) = result {
                 println!("Failed to run command: {}",err);
-                if let Err(why) = if command.get_interaction_response(&ctx.http).await.is_err() {
-                        command
-                        .create_interaction_response(&ctx.http, |response| {
-                            response.kind(InteractionResponseType::ChannelMessageWithSource)
-                                    .interaction_response_data(|message|message.content(err))
-                        })
-                        .await
-                    } else {
-                        command
-                        .edit_original_interaction_response(&ctx.http, |response| {
-                            response.content(err)
-                        })
-                        .await.map(|_|())
-                    }
+                if let Err(why) = if command.get_response(&ctx.http).await.is_err() {
+                    command.create_response(&ctx.http, 
+                        CreateInteractionResponse::Message(
+                            CreateInteractionResponseMessage::new().content(err.to_string())
+                        )
+                    ).await
+                } else {
+                    command.edit_response(&ctx.http, 
+                        EditInteractionResponse::new().content(err.to_string())
+                    ).await.map(|_|())
+                }
                 {
                     println!("Cannot respond to slash command: {}", why);
                 }
@@ -78,10 +57,20 @@ impl EventHandler for Handler {
 
     async fn ready(&self, ctx: Context, ready: Ready) {
         println!("{} is connected!", ready.user.name);
-        Command::create_global_application_command(&ctx.http, |command| {
-            register_join(command)
-        })
-        .await.expect("Failed creating commands");
+        let command = CreateCommand::new("join_voice")
+            .description("Join voice channel")
+            .add_option(
+                CreateCommandOption::new(
+                    CommandOptionType::Channel,
+                    "channel",
+                    "channel to join"
+                )
+                .required(true)
+            );
+
+        Command::create_global_command(&ctx.http, command)
+            .await
+            .expect("Failed creating commands");
     }
 }
 
@@ -92,8 +81,10 @@ pub struct General;
 #[command]
 #[only_in(guilds)]
 async fn deafen(ctx: &Context, msg: &Message) -> CommandResult {
-    let guild = msg.guild(&ctx.cache).expect("No guild found!");
-    let guild_id = guild.id;
+    let guild_id = {
+        let guild = msg.guild(&ctx.cache).expect("No guild found!");
+        guild.id
+    }; // guild is dropped here
 
     let manager = songbird::get(ctx).await
         .expect("Songbird Voice client placed in at initialisation.").clone();
@@ -122,27 +113,31 @@ async fn deafen(ctx: &Context, msg: &Message) -> CommandResult {
     Ok(())
 }
 
-fn register_join(command: &mut CreateApplicationCommand) -> &mut CreateApplicationCommand {
-    command.name("join_voice").description("Join voice channel")
-        .create_option(|option|
-            option.name("channel").description("channel to join")
-            .kind(CommandOptionType::Channel).required(true))
+fn register_join(command: CreateCommand) -> CreateCommand {
+    command
+        .name("join_voice")
+        .description("Join voice channel")
+        .add_option(
+            CreateCommandOption::new(
+                CommandOptionType::Channel,
+                "channel",
+                "channel to join"
+            )
+            .required(true)
+        )
 }
 
-async fn handle_join(ctx: &Context ,interaction: &ApplicationCommandInteraction) -> anyhow::Result<()> {
+async fn handle_join(ctx: &Context, interaction: &CommandInteraction) -> anyhow::Result<()> {
     let guild_id = match interaction.guild_id {
         Some(id) => id,
         None => bail!("Command can't be used outside of servers!"),
     };
     let option = interaction.data.options
-        .get(0)
-        .expect("Expected user option")
-        .resolved
-        .as_ref()
-        .expect("Expected user object");
+    .get(0)
+    .expect("Expected channel option");
 
-    let connect_to = match option {
-        CommandDataOptionValue::Channel(part_chan) => part_chan.id,
+    let connect_to = match &option.value {
+        CommandDataOptionValue::Channel(channel_id) => *channel_id,
         _ => bail!("Expected channel argument!"),
     };
     // let guild = msg.guild(&ctx.cache).expect("No guild found!");
@@ -161,67 +156,73 @@ async fn handle_join(ctx: &Context ,interaction: &ApplicationCommandInteraction)
     //     }
     // };
 
-    interaction.create_interaction_response(&ctx.http, |response: &mut serenity::builder::CreateInteractionResponse| {
-        response.kind(InteractionResponseType::DeferredChannelMessageWithSource)
-        .interaction_response_data(|f| f.ephemeral(true))
-        
-    })
-    .await;
+    interaction.create_response(&ctx.http, 
+        CreateInteractionResponse::Defer(
+            CreateInteractionResponseMessage::new().ephemeral(true)
+        )
+    ).await?;
 
     let manager = songbird::get(ctx).await
         .expect("Songbird Voice client placed in at initialisation.").clone();
         
-    let (handler_lock, conn_result) = manager.join(guild_id, connect_to).await;
-    conn_result?;
+    let handler_lock = manager.join(guild_id, connect_to).await?;
 
     // if let Ok(_) = conn_result {
         // NOTE: this skips listening for the actual connection result.
-        let channel: crate::AudioBufferDiscord;
-        let ts_buffer: crate::TsToDiscordPipeline;
-        {
-            let data_read = ctx.data.read().await;
-            let (ts_buf,chan) = data_read.get::<ListenerHolder>().expect("Expected CommandCounter in TypeMap.").clone();
-            channel = chan;
-            ts_buffer = ts_buf;
-        }
-        let mut handler = handler_lock.lock().await;
-        let discord_input = Input::float_pcm(true, songbird::input::Reader::Extension(Box::new(ts_buffer.clone())));
-        handler.play_only_source(discord_input);
-        handler.add_global_event(
-            CoreEvent::SpeakingStateUpdate.into(),
-            Receiver::new(channel.clone()),
-        );
+    let channel: crate::AudioBufferDiscord;
+    let ts_buffer: crate::TsToDiscordPipeline;
+    {
+        let data_read = ctx.data.read().await;
+        let (ts_buf,chan) = data_read.get::<ListenerHolder>().expect("Expected CommandCounter in TypeMap.").clone();
+        channel = chan;
+        ts_buffer = ts_buf;
+    }
+    let mut handler = handler_lock.lock().await;
+    // TODO: Need to implement proper custom audio source for Songbird 0.5.x
+    // The TeamSpeak->Discord audio pipeline needs to be redesigned for 0.5.x
+    println!("Warning: TeamSpeak to Discord audio forwarding not yet implemented for Songbird 0.5.x");
+    // Skip playing the input for now
+    let discord_input = Input::from(RawAdapter::new(
+        ts_buffer.clone(),
+        48000, // sample rate
+        2,     // channels (stereo)
+    ));
+    let _track = handler.play_input(discord_input);
 
-        handler.add_global_event(
-            CoreEvent::SpeakingUpdate.into(),
-            Receiver::new(channel.clone()),
-        );
+    handler.add_global_event(
+        CoreEvent::SpeakingStateUpdate.into(),
+        Receiver::new(channel.clone()),
+    );
 
-        handler.add_global_event(
-            CoreEvent::VoicePacket.into(),
-            Receiver::new(channel.clone()),
-        );
+    handler.add_global_event(
+        CoreEvent::VoiceTick.into(),
+        Receiver::new(channel.clone()),
+    );
 
-        handler.add_global_event(
-            CoreEvent::RtcpPacket.into(),
-            Receiver::new(channel.clone()),
-        );
+    handler.add_global_event(
+        CoreEvent::RtcpPacket.into(),
+        Receiver::new(channel.clone()),
+    );
 
-        handler.add_global_event(
-            CoreEvent::ClientDisconnect.into(),
-            Receiver::new(channel),
-        );
+    handler.add_global_event(
+        CoreEvent::ClientDisconnect.into(),
+        Receiver::new(channel.clone()),
+    );
+
+    handler.add_global_event(
+        CoreEvent::RtpPacket.into(),
+        Receiver::new(channel.clone()),
+    );
+
 
     //     check_msg(msg.channel_id.say(&ctx.http, &format!("Joined {}", connect_to.mention())).await);
     // } else {
     //     check_msg(msg.channel_id.say(&ctx.http, "Error joining the channel").await);
     // }
     println!("joined");
-    interaction.edit_original_interaction_response(&ctx.http, |response| {
-        // response.kind(InteractionResponseType::ChannelMessageWithSource).content("Joined")
-        response.content("Joined")  
-    })
-    .await?;
+    interaction.edit_response(&ctx.http, 
+        EditInteractionResponse::new().content("Joined")
+    ).await?;
     // interaction.create_followup_message(&ctx.http, |response| {
     //     response.content("Joined")
     // }).await?;
@@ -231,8 +232,10 @@ async fn handle_join(ctx: &Context ,interaction: &ApplicationCommandInteraction)
 #[command]
 #[only_in(guilds)]
 async fn leave(ctx: &Context, msg: &Message) -> CommandResult {
-    let guild = msg.guild(&ctx.cache).expect("No guild found!");
-    let guild_id = guild.id;
+    let guild_id = {
+        let guild = msg.guild(&ctx.cache).expect("No guild found!");
+        guild.id
+    }; // guild is dropped here
 
     let manager = songbird::get(ctx).await
         .expect("Songbird Voice client placed in at initialisation.").clone();
@@ -254,8 +257,10 @@ async fn leave(ctx: &Context, msg: &Message) -> CommandResult {
 #[command]
 #[only_in(guilds)]
 async fn mute(ctx: &Context, msg: &Message) -> CommandResult {
-    let guild = msg.guild(&ctx.cache).expect("No guild found!");
-    let guild_id = guild.id;
+    let guild_id = {
+        let guild = msg.guild(&ctx.cache).expect("No guild found!");
+        guild.id
+    }; // guild is dropped here
 
     let manager = songbird::get(ctx).await
         .expect("Songbird Voice client placed in at initialisation.").clone();
@@ -298,19 +303,19 @@ async fn play(ctx: &Context, msg: &Message, mut args: Args) -> CommandResult {
         Ok(url) => url,
         Err(_) => {
             check_msg(msg.channel_id.say(&ctx.http, "Must provide a URL to a video or audio").await);
-
             return Ok(());
         },
     };
 
     if !url.starts_with("http") {
         check_msg(msg.channel_id.say(&ctx.http, "Must provide a valid URL").await);
-
         return Ok(());
     }
 
-    let guild = msg.guild(&ctx.cache).expect("No guild found!");
-    let guild_id = guild.id;
+    let guild_id = {
+        let guild = msg.guild(&ctx.cache).expect("No guild found!");
+        guild.id
+    }; // guild is dropped here
 
     let manager = songbird::get(ctx).await
         .expect("Songbird Voice client placed in at initialisation.").clone();
@@ -318,20 +323,32 @@ async fn play(ctx: &Context, msg: &Message, mut args: Args) -> CommandResult {
     if let Some(handler_lock) = manager.get(guild_id) {
         let mut handler = handler_lock.lock().await;
 
-        let source = match songbird::ytdl(&url).await {
-            Ok(source) => source,
-            Err(why) => {
-                println!("Err starting source: {:?}", why);
+        // Create a reqwest client (ideally you'd share this across requests in production)
+        let client = reqwest::Client::new();
+        
+        // Create a lazy YouTube DL source
+        let mut src = songbird::input::YoutubeDl::new(client, url.clone());
 
-                check_msg(msg.channel_id.say(&ctx.http, "Error sourcing ffmpeg").await);
+        // Optionally fetch metadata first
+        match src.aux_metadata().await {
+            Ok(metadata) => {
+                let title = metadata.title.as_deref().unwrap_or("<Unknown>");
+                let artist = metadata.artist.as_deref().unwrap_or("<Unknown>");
+                
+                check_msg(
+                    msg.channel_id
+                        .say(&ctx.http, format!("Playing **{}** by **{}**", title, artist))
+                        .await
+                );
 
-                return Ok(());
+                // Play the source
+                let _handle = handler.play_input(src.into());
             },
-        };
-
-        handler.play_source(source);
-
-        check_msg(msg.channel_id.say(&ctx.http, "Playing song").await);
+            Err(why) => {
+                println!("Error fetching metadata: {:?}", why);
+                check_msg(msg.channel_id.say(&ctx.http, "Error fetching audio source").await);
+            }
+        }
     } else {
         check_msg(msg.channel_id.say(&ctx.http, "Not in a voice channel to play in").await);
     }
@@ -342,8 +359,10 @@ async fn play(ctx: &Context, msg: &Message, mut args: Args) -> CommandResult {
 #[command]
 #[only_in(guilds)]
 async fn undeafen(ctx: &Context, msg: &Message) -> CommandResult {
-    let guild = msg.guild(&ctx.cache).expect("No guild found!");
-    let guild_id = guild.id;
+    let guild_id = {
+        let guild = msg.guild(&ctx.cache).expect("No guild found!");
+        guild.id
+    }; // guild is dropped here
 
     let manager = songbird::get(ctx).await
         .expect("Songbird Voice client placed in at initialisation.").clone();
@@ -365,9 +384,11 @@ async fn undeafen(ctx: &Context, msg: &Message) -> CommandResult {
 #[command]
 #[only_in(guilds)]
 async fn unmute(ctx: &Context, msg: &Message) -> CommandResult {
-    let guild = msg.guild(&ctx.cache).expect("No guild found!");
-    let guild_id = guild.id;
-    
+    let guild_id = {
+        let guild = msg.guild(&ctx.cache).expect("No guild found!");
+        guild.id
+    }; // guild is dropped here
+
     let manager = songbird::get(ctx).await
         .expect("Songbird Voice client placed in at initialisation.").clone();
 
@@ -406,97 +427,94 @@ impl Receiver {
     }
 }
 
+
 #[async_trait]
 impl VoiceEventHandler for Receiver {
-    #[allow(unused_variables)]
     async fn act(&self, ctx: &EventContext<'_>) -> Option<Event> {
-        use EventContext as Ctx;
         match ctx {
-            Ctx::SpeakingStateUpdate(
-                Speaking {speaking, ssrc, user_id, ..}
-            ) => {
-                // Discord voice calls use RTP, where every sender uses a randomly allocated
-                // *Synchronisation Source* (SSRC) to allow receivers to tell which audio
-                // stream a received packet belongs to. As this number is not derived from
-                // the sender's user_id, only Discord Voice Gateway messages like this one
-                // inform us about which random SSRC a user has been allocated. Future voice
-                // packets will contain *only* the SSRC.
-                //
-                // You can implement logic here so that you can differentiate users'
-                // SSRCs and map the SSRC to the User ID and maintain this state.
-                // Using this map, you can map the `ssrc` in `voice_packet`
-                // to the user ID and handle their audio packets separately.
-                //println!(
-                //     "Speaking state update: user {:?} has SSRC {:?}, using {:?}",
-                //     user_id,
-                //     ssrc,
-                //     speaking,
-                // );
+            EventContext::SpeakingStateUpdate(speaking) => {
+                // Handle speaking state updates
+                println!("Speaking state: ssrc={}, user_id={:?}", speaking.ssrc, speaking.user_id);
             },
-            Ctx::SpeakingUpdate(_) => {
-                // You can implement logic here which reacts to a user starting
-                // or stopping speaking.
-                //println!(
-                //     "Source {} has {} speaking.",
-                //     ssrc,
-                //     if *speaking {"started"} else {"stopped"},
-                // );
-            },
-            Ctx::VoicePacket(data) => {
-                // {audio, packet, payload_offset, payload_end_pad}
-                // An event which fires for every received audio packet,
-
-                // get raw opus package, we don't decode here and leave that to the AudioHandler
-                let packet = data.packet;
-                let last_bytes = packet.payload.len() - data.payload_end_pad;
-                let data = &packet.payload[data.payload_offset..last_bytes];
-                let start = if packet.extension != 0 {
-                    match RtpExtensionPacket::new(data) {
-                        Some(v) => v.packet_size(),
-                        None => {
-                            eprintln!("Extension packet indicated, but insufficient space.");
-                            return None;
+            EventContext::RtpPacket(rtp_data) => {
+                // Parse the RTP packet manually from bytes
+                // RTP header is at least 12 bytes
+                let packet_bytes = &rtp_data.packet;
+    
+                if packet_bytes.len() < 12 {
+                    return None; // Too short to be valid RTP
+                }
+    
+                // Parse RTP header (simplified)
+                // Byte 0: V(2), P(1), X(1), CC(4)
+                // Bytes 4-7: SSRC
+                // Bytes 2-3: Sequence number
+                // Payload starts at byte 12 (or more if there are extensions)
+    
+                let ssrc = u32::from_be_bytes([
+                    packet_bytes[8],
+                    packet_bytes[9],
+                    packet_bytes[10],
+                    packet_bytes[11],
+                ]);
+    
+                let sequence = u16::from_be_bytes([
+                    packet_bytes[2],
+                    packet_bytes[3],
+                ]);
+    
+                // Check for extension (X bit in byte 0)
+                let has_extension = (packet_bytes[0] & 0x10) != 0;
+                let mut payload_offset = 12;
+    
+                if has_extension && packet_bytes.len() >= 16 {
+                    // Extension header is 4 bytes, then extension data
+                    let ext_len = u16::from_be_bytes([
+                        packet_bytes[14],
+                        packet_bytes[15],
+                    ]) as usize * 4;
+                    payload_offset = 16 + ext_len;
+                }
+    
+                if payload_offset < packet_bytes.len() {
+                    let opus_data = &packet_bytes[payload_offset..];
+        
+                    let dur;
+                    {
+                        let time = std::time::Instant::now();
+                        let mut lock = self.sink.lock().await;
+                        dur = time.elapsed();
+                        if let Err(e) = lock.handle_packet(ssrc, sequence, opus_data.to_vec()) {
+                            eprintln!("Failed to handle Discord voice packet: {}", e);
+                        }
+                        if dur.as_millis() > 1 {
+                            eprintln!("Acquiring lock took {}ms", dur.as_millis());
                         }
                     }
-                } else {
-                    0
-                };
-                let opus_slice = &data[start..];
-                let dur;
-                {
-                    let time = std::time::Instant::now();
-                    let mut lock = self.sink.lock().await;
-                    dur = time.elapsed();
-                    if let Err(e) = lock.handle_packet(packet.ssrc, packet.sequence.0.0, opus_slice.to_vec()) {
-                        eprintln!("Failed to handle Discord voice packet: {}",e);
-                    }
-                    if dur.as_millis() > 1 {
-                        eprintln!("Acquiring lock took {}ms",dur.as_millis());
+                }
+            },
+            EventContext::VoiceTick(tick) => {
+                // VoiceTick fires every 20ms with decoded PCM audio
+                for (&ssrc, voice_data) in &tick.speaking {
+                    if let Some(audio) = &voice_data.decoded_voice {
+                        // This is decoded PCM audio (Vec<i16>)
+                        // You can process it here or pass to your audio handler
+                        if audio.len() > 0 {
+                            println!("Voice tick for SSRC {}: {} samples", ssrc, audio.len());
+                            // TODO: Adapt your audio handler to work with decoded PCM
+                            // instead of raw Opus packets
+                        }
                     }
                 }
-                
             },
-            Ctx::RtcpPacket(_) => {
-                // An event which fires for every received rtcp packet,
-                // containing the call statistics and reporting information.
-                //println!("RTCP packet received: {:?}", packet);
+            EventContext::RtcpPacket(_rtcp_data) => {
+                // Handle RTCP packets if needed
             },
-            Ctx::ClientDisconnect(
-                ClientDisconnect {user_id, ..}
-            ) => {
-                // You can implement your own logic here to handle a user who has left the
-                // voice channel e.g., finalise processing of statistics etc.
-                // You will typically need to map the User ID to their SSRC; observed when
-                // speaking or connecting.
-
-                println!("Client disconnected: user {:?}", user_id);
+            EventContext::ClientDisconnect(disconnect) => {
+                println!("Client disconnected: user {:?}", disconnect.user_id);
             },
-            _ => {
-                // We won't be registering this struct for any more event classes.
-                unimplemented!()
-            }
+            _ => {}
         }
-
         None
     }
 }

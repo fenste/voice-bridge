@@ -3,7 +3,6 @@ use std::{io::Read, mem::size_of, sync::Arc, time::Duration};
 use byte_slice_cast::AsByteSlice;
 use serde::Deserialize;
 use serenity::prelude::GatewayIntents;
-use songbird::input::reader::MediaSource;
 use tsclientlib::{ClientId, Connection, DisconnectOptions, Identity, StreamItem};
 use tsproto_packets::packets::{AudioData, CodecType, OutAudio, OutPacket};
 use audiopus::coder::Encoder;
@@ -12,6 +11,8 @@ use slog::{debug, o, Drain, Logger};
 use tokio::task;
 use tokio::sync::Mutex;
 use anyhow::{bail,Result};
+use symphonia::core::io::MediaSource;
+use rustls::crypto::CryptoProvider;
 
 mod discord;
 mod discord_audiohandler;
@@ -23,7 +24,6 @@ struct ConnectionId(u64);
 // to the client builder below, making it easy to install this voice client.
 // The voice client can be retrieved in any command using `songbird::get(ctx).await`.
 use songbird::{SerenityInit, Songbird};
-use songbird::driver::{DecodeMode};
 use songbird::Config as DriverConfig;
 
 // Import the `Context` to handle commands.
@@ -67,19 +67,19 @@ struct TsToDiscordPipeline {
 	data: Arc<std::sync::Mutex<TsAudioHandler>>,
 }
 
-impl MediaSource for TsToDiscordPipeline {
-    fn is_seekable(&self) -> bool {
-        false
-    }
-
-    fn byte_len(&self) -> Option<u64> {
-        None
-    }
-}
-
 impl Seek for TsToDiscordPipeline {
     fn seek(&mut self, _: std::io::SeekFrom) -> std::io::Result<u64> {
         Err(std::io::Error::new(std::io::ErrorKind::Other, "source does not support seeking"))
+    }
+}
+
+impl MediaSource for TsToDiscordPipeline {
+    fn is_seekable(&self) -> bool {
+        false  // Your audio stream is not seekable
+    }
+
+    fn byte_len(&self) -> Option<u64> {
+        None  // Unknown length for a live stream
     }
 }
 
@@ -93,20 +93,35 @@ impl TsToDiscordPipeline {
 
 impl Read for TsToDiscordPipeline {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-		let len = buf.len() / size_of::<f32>();
-		let mut wtr: Vec<f32> = vec![0.0; len];
-		// TODO: can't we support async read for songbird ? this is kinda bad as it requires a sync mutex
-		{
-			let mut lock = self.data.lock().expect("Can't lock ts voice buffer!");
-
-			// and this is really ugly.. read only works for u8, but we get an f32 and need to convert that without changing AudioHandlers API
-			// also Read for stuff that specifies to use f32 is kinda meh			
-			lock.fill_buffer(wtr.as_mut_slice());
-		}
-		let slice = wtr.as_byte_slice();
-		buf.copy_from_slice(slice);
-
-		Ok(buf.len())
+        let samples_requested = buf.len() / size_of::<f32>();
+        let samples_to_read = samples_requested.min(1920);
+        
+        let mut audio_buffer: Vec<f32> = vec![0.0; samples_to_read];
+        
+        {
+            let mut lock = self.data.lock().expect("Can't lock ts voice buffer!");
+            lock.fill_buffer(audio_buffer.as_mut_slice());
+        }
+        
+        // Debug: Check if we have actual audio
+        let max_sample = audio_buffer.iter().map(|s| s.abs()).fold(0.0f32, f32::max);
+        if max_sample > 0.001 {
+            eprintln!("TS→Discord: max sample: {:.4}, samples requested: {}, sending: {}", 
+                      max_sample, samples_requested, samples_to_read);
+        }
+        
+        // Apply gain
+        const GAIN: f32 = 3.0;
+        for sample in &mut audio_buffer {
+            *sample *= GAIN;
+            *sample = sample.clamp(-1.0, 1.0);
+        }
+        
+        let slice = audio_buffer.as_byte_slice();
+        let bytes_to_copy = slice.len().min(buf.len());
+        buf[..bytes_to_copy].copy_from_slice(&slice[..bytes_to_copy]);
+        
+        Ok(bytes_to_copy)
     }
 }
 
@@ -126,6 +141,10 @@ const MAX_OPUS_FRAME_SIZE: usize = 1275;
 const RUST_LOG: &'static str = "RUST_LOG";
 #[tokio::main]
 async fn main() -> Result<()> {
+	// Install the ring crypto provider for rustls before anything else
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .expect("Failed to install rustls crypto provider");
 	if std::env::var(RUST_LOG).is_err() {
         std::env::set_var(
             RUST_LOG,
@@ -147,19 +166,17 @@ async fn main() -> Result<()> {
 		Logger::root(drain, o!())
 	};
     // init discord framework
-    let framework = StandardFramework::new()
-        .configure(|c| c
-                   .prefix("~"))
-        .group(&discord::GENERAL_GROUP);
+    let framework = StandardFramework::new();
+	let framework = framework.group(&discord::GENERAL_GROUP);
 
 	// Here, we need to configure Songbird to decode all incoming voice packets.
     // If you want, you can do this on a per-call basis---here, we need it to
     // read the audio data that other people are sending us!
     let songbird = Songbird::serenity();
-    songbird.set_config(
-        DriverConfig::default()
-            .decode_mode(DecodeMode::Decrypt)
-    );
+	songbird.set_config(
+    	DriverConfig::default()
+        	.decode_mode(songbird::driver::DecodeMode::Decode)
+	);
 
 	let intents = GatewayIntents::GUILD_MESSAGES
         | GatewayIntents::MESSAGE_CONTENT
