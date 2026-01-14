@@ -57,3 +57,7 @@ features = ["client", "gateway", "voice", "rustls_backend", "builder"]
 [dependencies.tokio]
 version = "1.0"
 features = ["macros", "rt-multi-thread", "signal", "sync"]
+
+# Force all dependencies to use rustls instead of native-tls/OpenSSL
+[patch.crates-io]
+reqwest = { version = "0.11", default-features = false, features = ["rustls-tls", "json", "stream", "multipart"] }
