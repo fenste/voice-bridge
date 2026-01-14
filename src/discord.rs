@@ -193,6 +193,7 @@ pub async fn ping(ctx: Context<'_>) -> Result<(), Error> {
 }
 
 /// Play audio from a URL
+/*
 #[poise::command(slash_command, guild_only)]
 pub async fn play(
     ctx: Context<'_>,
@@ -236,7 +237,7 @@ pub async fn play(
 
     Ok(())
 }
-
+*/
 struct Receiver {
     sink: crate::AudioBufferDiscord,
 }

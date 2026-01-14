@@ -256,7 +256,7 @@ async fn main() -> Result<()> {
                 discord::mute(),
                 discord::unmute(),
                 discord::ping(),
-                discord::play(),
+                //discord::play(),
             ],
             ..Default::default()
         })

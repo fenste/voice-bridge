@@ -60,7 +60,3 @@ features = ["client", "gateway", "voice", "rustls_backend", "builder"]
 [dependencies.tokio]
 version = "1.0"
 features = ["macros", "rt-multi-thread", "signal", "sync"]
-
-# Force all dependencies to use the same reqwest version
-[patch.crates-io]
-reqwest = { version = "0.11", default-features = false, features = ["rustls-tls", "json", "multipart", "stream"] }
