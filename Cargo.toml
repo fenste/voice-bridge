@@ -18,6 +18,7 @@ lto = true
 
 [dependencies]
 toml = "0.7"
+poise = "0.6"
 serde = { version = "1.0", features = ["derive"] }
 rustls = { version = "0.23", features = ["ring"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }

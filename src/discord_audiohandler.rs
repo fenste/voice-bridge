@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+//discord_audiohandler.rs
 //! COPIED FROM tsclientlib https://github.com/ReSpeak/tsclientlib/blob/e4d2baa8aaee5cd793a982e2805d7baf46b715b9/tsclientlib/src/audio.rs
 //! Copyright by their respective owners. 
 //! Adopted to allow usage with non-ts packages.
