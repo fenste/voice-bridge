@@ -49,7 +49,7 @@ version = "0.2"
 [dependencies.songbird]
 version = "0.5"
 default-features = false
-features = ["driver", "gateway", "receive", "rustls"]
+features = ["driver", "gateway", "receive", "rustls", "tungstenite"]
 
 [dependencies.serenity]
 version = "0.12"
