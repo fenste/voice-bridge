@@ -39,7 +39,6 @@ struct Config {
     teamspeak_channel_password: Option<String>,
     teamspeak_name: Option<String>,
     verbose: i32,
-    #[allow(dead_code)]
     volume: f32,
 }
 
@@ -94,7 +93,7 @@ impl Read for TsToDiscordPipeline {
             .map(|s| s.abs())
             .fold(0.0f32, f32::max);
         if max_sample > 0.001 {
-            eprintln!(
+            tracing::debug!(
                 "TS→Discord: max sample: {:.4}, samples requested: {}",
                 max_sample,
                 samples_requested
@@ -147,7 +146,7 @@ impl BufferedPipeline {
                     match std::io::Read::read(&mut reader, &mut temp_buf) {
                         Ok(n) => n,
                         Err(e) => {
-                            eprintln!("Buffer filler read error: {}", e);
+                            tracing::warn!("Buffer filler read error: {}", e);
                             continue;
                         }
                     }
@@ -257,6 +256,9 @@ async fn main() -> Result<()> {
                 discord::unmute(),
                 discord::ping(),
                 discord::play(),
+                discord::volume(),
+                discord::volume_check(),
+                discord::reset_audio(),
             ],
             ..Default::default()
         })
@@ -286,9 +288,9 @@ async fn main() -> Result<()> {
     let teamspeak_voice_handler = TsToDiscordPipeline::new(ts_voice_logger);
 
     let discord_voice_logger = logger.new(o!("pipeline" => "voice-discord"));
-    let discord_voice_buffer: AudioBufferDiscord = Arc::new(
-        Mutex::new(discord_audiohandler::AudioHandler::new(discord_voice_logger))
-    );
+    let mut handler = discord_audiohandler::AudioHandler::new(discord_voice_logger);
+    handler.set_global_volume(config.volume);
+    let discord_voice_buffer: AudioBufferDiscord = Arc::new(Mutex::new(handler));
     
     {
         let mut data = client.data.write().await;
@@ -358,8 +360,6 @@ async fn main() -> Result<()> {
                     _ => panic!("Can only handle S2C packets but got a C2S packet"),
                 });
 
-                eprintln!("TS packet: client {:?}", from.0);
-
                 let mut ts_voice = teamspeak_voice_handler.data
                     .lock()
                     .expect("Can't lock ts audio buffer!");
@@ -377,7 +377,7 @@ async fn main() -> Result<()> {
                     con.send_audio(processed)?;
                     let dur = start.elapsed();
                     if dur >= Duration::from_millis(1) {
-                        eprintln!("Audio pipeline took {}ms",dur.as_millis());
+                        tracing::debug!("Audio pipeline took {}ms",dur.as_millis());
                     }
                 }
             }
@@ -414,7 +414,7 @@ async fn process_discord_audio(
             let lock = encoder_c.try_lock().expect("Can't reach encoder!");
             let length = match lock.encode_float(&data, &mut encoded) {
                 Err(e) => {
-                    eprintln!("Failed to encode voice: {}", e);
+                    tracing::error!("Failed to encode voice: {}", e);
                     return None;
                 }
                 Ok(size) => size,
@@ -422,7 +422,7 @@ async fn process_discord_audio(
             
             let duration = start.elapsed().as_millis();
             if duration > 2 {
-                eprintln!("Took too {}ms for processing audio!", duration);
+                tracing::warn!("Took too {}ms for processing audio!", duration);
             }
             
             Some(

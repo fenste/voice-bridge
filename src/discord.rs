@@ -243,6 +243,62 @@ pub async fn play(
     Ok(())
 }
 
+/// Set the bot's output volume
+#[poise::command(slash_command, guild_only)]
+pub async fn volume(
+    ctx: Context<'_>,
+    #[description = "Volume level (0.0 to 2.0, default 1.0)"]
+    #[min = 0.0]
+    #[max = 2.0]
+    level: f32,
+) -> Result<(), Error> {
+    let data_read = ctx.serenity_context().data.read().await;
+    let (_, discord_buffer) = data_read
+        .get::<crate::ListenerHolder>()
+        .ok_or("Audio handlers not found")?
+        .clone();
+    
+    let mut lock = discord_buffer.lock().await;
+    lock.set_global_volume(level);
+    
+    ctx.say(format!("🔊 Volume set to: {:.0}%", level * 100.0)).await?;
+    
+    Ok(())
+}
+
+/// Reset all audio queues (use if audio gets stuck)
+#[poise::command(slash_command, guild_only)]
+pub async fn reset_audio(ctx: Context<'_>) -> Result<(), Error> {
+    let data_read = ctx.serenity_context().data.read().await;
+    let (_, discord_buffer) = data_read
+        .get::<crate::ListenerHolder>()
+        .ok_or("Audio handlers not found")?
+        .clone();
+    
+    let mut lock = discord_buffer.lock().await;
+    lock.reset();
+    
+    ctx.say("🔄 Audio queues reset!").await?;
+    Ok(())
+}
+
+/// Check the current bot output volume
+#[poise::command(slash_command, guild_only)]
+pub async fn volume_check(ctx: Context<'_>) -> Result<(), Error> {
+    let data_read = ctx.serenity_context().data.read().await;
+    let (_, discord_buffer) = data_read
+        .get::<crate::ListenerHolder>()
+        .ok_or("Audio handlers not found")?
+        .clone();
+    
+    let lock = discord_buffer.lock().await;
+    let current = lock.get_global_volume();
+    
+    ctx.say(format!("🔊 Current volume: {:.0}%", current * 100.0)).await?;
+    
+    Ok(())
+}
+
 struct Receiver {
     sink: crate::AudioBufferDiscord,
 }
@@ -296,10 +352,10 @@ impl VoiceEventHandler for Receiver {
                         let mut lock = self.sink.lock().await;
                         dur = time.elapsed();
                         if let Err(e) = lock.handle_packet(ssrc, sequence, opus_data.to_vec()) {
-                            eprintln!("Failed to handle Discord voice packet: {}", e);
+                            tracing::error!("Failed to handle Discord voice packet: {}", e);
                         }
                         if dur.as_millis() > 1 {
-                            eprintln!("Acquiring lock took {}ms", dur.as_millis());
+                            tracing::debug!("Acquiring lock took {}ms", dur.as_millis());
                         }
                     }
                 }
@@ -308,7 +364,7 @@ impl VoiceEventHandler for Receiver {
                 for (&ssrc, voice_data) in &tick.speaking {
                     if let Some(audio) = &voice_data.decoded_voice {
                         if audio.len() > 0 {
-                            println!("Voice tick for SSRC {}: {} samples", ssrc, audio.len());
+                            tracing::debug!("Voice tick for SSRC {}: {} samples", ssrc, audio.len());
                         }
                     }
                 }
