@@ -2,7 +2,7 @@
 
 A real-time audio bridge between TeamSpeak 3 and Discord voice channels using Rust.
 
-**Status:** Stable and production-ready. Migrated to modern Poise framework with automated builds for multiple platforms.
+**Status:** Migrated to modern Poise framework with automated builds for multiple platforms.
 
 ## About This Fork
 
