@@ -193,7 +193,6 @@ pub async fn ping(ctx: Context<'_>) -> Result<(), Error> {
 }
 
 /// Play audio from a URL
-/*
 #[poise::command(slash_command, guild_only)]
 pub async fn play(
     ctx: Context<'_>,
@@ -213,31 +212,35 @@ pub async fn play(
     if let Some(handler_lock) = manager.get(guild_id) {
         let mut handler = handler_lock.lock().await;
 
-        let client = reqwest::Client::new();
-        let mut src = songbird::input::YoutubeDl::new(client, url.clone());
-
         ctx.defer().await?;
 
+        let client = reqwest::Client::builder()
+            .build()
+            .map_err(|e| format!("Failed to create HTTP client: {}", e))?;
+        
+        let mut src = songbird::input::YoutubeDl::new(client, url.clone());
+
+        // Try to fetch metadata
         match src.aux_metadata().await {
             Ok(metadata) => {
                 let title = metadata.title.as_deref().unwrap_or("<Unknown>");
                 let artist = metadata.artist.as_deref().unwrap_or("<Unknown>");
-
                 ctx.say(format!("Playing **{}** by **{}**", title, artist)).await?;
-                let _handle = handler.play_input(src.into());
             }
             Err(why) => {
                 println!("Error fetching metadata: {:?}", why);
-                ctx.say("Error fetching audio source").await?;
+                ctx.say(format!("Playing: {}", url)).await?;
             }
         }
+        
+        let _handle = handler.play_input(src.into());
     } else {
         ctx.say("Not in a voice channel to play in").await?;
     }
 
     Ok(())
 }
-*/
+
 struct Receiver {
     sink: crate::AudioBufferDiscord,
 }
