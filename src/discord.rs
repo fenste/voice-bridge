@@ -198,8 +198,6 @@ pub async fn play(
     ctx: Context<'_>,
     #[description = "URL to play"] url: String,
 ) -> Result<(), Error> {
-    use songbird::input::Compose;
-    
     if !url.starts_with("http") {
         ctx.say("Must provide a valid URL").await?;
         return Ok(());
@@ -216,22 +214,21 @@ pub async fn play(
 
         ctx.defer().await?;
 
-        // Create reqwest client for metadata fetching
         let client = reqwest::Client::builder()
             .build()
             .map_err(|e| format!("Failed to create HTTP client: {}", e))?;
         
-        // YoutubeDl will use yt-dlp + ffmpeg automatically
         let mut src = songbird::input::YoutubeDl::new(client, url.clone());
 
-        // Try to fetch metadata, but don't fail if it doesn't work
-        match src.aux_metadata().await {
-            Ok(metadata) => {
-                let title = metadata.title.as_deref().unwrap_or("Unknown");
-                ctx.say(format!("Playing: {}", title)).await?;
-            }
-            Err(_) => {
+        // Force it to search/download first
+        // The parameter is max search results (None = default)
+        match src.search(None).await {
+            Ok(_) => {
                 ctx.say(format!("Playing: {}", url)).await?;
+            }
+            Err(e) => {
+                ctx.say(format!("Failed to load audio: {:?}", e)).await?;
+                return Ok(());
             }
         }
         
