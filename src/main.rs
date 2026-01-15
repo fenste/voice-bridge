@@ -255,7 +255,6 @@ async fn main() -> Result<()> {
                 discord::mute(),
                 discord::unmute(),
                 discord::ping(),
-                discord::play(),
                 discord::volume(),
                 discord::volume_check(),
                 discord::reset_audio(),
