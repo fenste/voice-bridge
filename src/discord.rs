@@ -5,7 +5,7 @@ use serenity::all::{Context as SerenityContext, Ready};
 use poise::serenity_prelude as serenity;
 
 // Songbird imports
-use songbird::input::{Input, RawAdapter, Compose};
+use songbird::input::{Input, RawAdapter};
 use songbird::events::EventContext;
 use songbird::{Event, EventHandler as VoiceEventHandler};
 use songbird::events::CoreEvent;
@@ -198,6 +198,8 @@ pub async fn play(
     ctx: Context<'_>,
     #[description = "URL to play"] url: String,
 ) -> Result<(), Error> {
+    use songbird::input::Compose;
+    
     if !url.starts_with("http") {
         ctx.say("Must provide a valid URL").await?;
         return Ok(());
@@ -214,21 +216,21 @@ pub async fn play(
 
         ctx.defer().await?;
 
+        // Create reqwest client for metadata fetching
         let client = reqwest::Client::builder()
             .build()
             .map_err(|e| format!("Failed to create HTTP client: {}", e))?;
         
+        // YoutubeDl will use yt-dlp + ffmpeg automatically
         let mut src = songbird::input::YoutubeDl::new(client, url.clone());
 
-        // Try to fetch metadata
+        // Try to fetch metadata, but don't fail if it doesn't work
         match src.aux_metadata().await {
             Ok(metadata) => {
-                let title = metadata.title.as_deref().unwrap_or("<Unknown>");
-                let artist = metadata.artist.as_deref().unwrap_or("<Unknown>");
-                ctx.say(format!("Playing **{}** by **{}**", title, artist)).await?;
+                let title = metadata.title.as_deref().unwrap_or("Unknown");
+                ctx.say(format!("Playing: {}", title)).await?;
             }
-            Err(why) => {
-                println!("Error fetching metadata: {:?}", why);
+            Err(_) => {
                 ctx.say(format!("Playing: {}", url)).await?;
             }
         }
