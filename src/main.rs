@@ -303,7 +303,7 @@ async fn main() -> Result<()> {
         ));
     }
 
-    tokio::spawn(async move {
+    let client_handle = tokio::spawn(async move {
         let _ = client.start().await.map_err(|why| println!("Client ended: {:?}", why));
     });
 
@@ -408,6 +408,13 @@ async fn main() -> Result<()> {
             eprintln!("  Error leaving guild {}: {:?}", guild_id, e);
         }
     }
+
+    // Give a moment for Discord to process the leave
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Abort the client task
+    client_handle.abort();
+    println!("Discord client stopped");
 
     println!("Disconnecting from TeamSpeak...");
     con.disconnect(DisconnectOptions::new())?;
