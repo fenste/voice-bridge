@@ -1,13 +1,13 @@
 use serenity::async_trait;
-use serenity::all::{Context as SerenityContext, Ready};
+use serenity::all::{ Context as SerenityContext, Ready };
 
 // Poise imports
 use poise::serenity_prelude as serenity;
 
 // Songbird imports
-use songbird::input::{Input, RawAdapter};
+use songbird::input::{ Input, RawAdapter };
 use songbird::events::EventContext;
-use songbird::{Event, EventHandler as VoiceEventHandler};
+use songbird::{ Event, EventHandler as VoiceEventHandler };
 use songbird::events::CoreEvent;
 
 use crate::ListenerHolder;
@@ -33,23 +33,27 @@ impl serenity::EventHandler for Handler {
 #[poise::command(slash_command, guild_only)]
 pub async fn join(
     ctx: Context<'_>,
-    #[description = "Voice channel to join"] channel: serenity::Channel,
+    #[description = "Voice channel to join"] channel: serenity::Channel
 ) -> Result<(), Error> {
     let guild_id = ctx.guild_id().ok_or("Not in a guild")?;
-    
+
     let connect_to = match channel {
         serenity::Channel::Guild(ch) => ch.id,
         _ => {
-            ctx.send(poise::CreateReply::default()
-                .content("Must specify a voice channel")
-                .ephemeral(true)).await?;
+            ctx.send(
+                poise::CreateReply
+                    ::default()
+                    .content("Must specify a voice channel")
+                    .ephemeral(true)
+            ).await?;
             return Ok(());
         }
     };
 
     ctx.defer_ephemeral().await?;
 
-    let manager = songbird::get(ctx.serenity_context()).await
+    let manager = songbird
+        ::get(ctx.serenity_context()).await
         .expect("Songbird Voice client placed in at initialisation.")
         .clone();
 
@@ -69,7 +73,7 @@ pub async fn join(
     }
 
     let mut handler = handler_lock.lock().await;
-    
+
     let buffered = BufferedPipeline::new(ts_buffer.clone());
     buffered.start_filler();
 
@@ -82,9 +86,7 @@ pub async fn join(
     handler.add_global_event(CoreEvent::ClientDisconnect.into(), Receiver::new(channel.clone()));
     handler.add_global_event(CoreEvent::RtpPacket.into(), Receiver::new(channel.clone()));
 
-    ctx.send(poise::CreateReply::default()
-        .content("Joined voice channel!")
-        .ephemeral(true)).await?;
+    ctx.send(poise::CreateReply::default().content("Joined voice channel!").ephemeral(true)).await?;
     Ok(())
 }
 
@@ -93,21 +95,22 @@ pub async fn join(
 pub async fn leave(ctx: Context<'_>) -> Result<(), Error> {
     let guild_id = ctx.guild_id().ok_or("Not in a guild")?;
 
-    let manager = songbird::get(ctx.serenity_context()).await
+    let manager = songbird
+        ::get(ctx.serenity_context()).await
         .expect("Songbird Voice client placed in at initialisation.")
         .clone();
-    
+
     let has_handler = manager.get(guild_id).is_some();
 
     if has_handler {
         manager.remove(guild_id).await?;
-        ctx.send(poise::CreateReply::default()
-            .content("Left voice channel")
-            .ephemeral(true)).await?;
+        ctx.send(
+            poise::CreateReply::default().content("Left voice channel").ephemeral(true)
+        ).await?;
     } else {
-        ctx.send(poise::CreateReply::default()
-            .content("Not in a voice channel")
-            .ephemeral(true)).await?;
+        ctx.send(
+            poise::CreateReply::default().content("Not in a voice channel").ephemeral(true)
+        ).await?;
     }
 
     Ok(())
@@ -118,7 +121,8 @@ pub async fn leave(ctx: Context<'_>) -> Result<(), Error> {
 pub async fn deafen(ctx: Context<'_>) -> Result<(), Error> {
     let guild_id = ctx.guild_id().ok_or("Not in a guild")?;
 
-    let manager = songbird::get(ctx.serenity_context()).await
+    let manager = songbird
+        ::get(ctx.serenity_context()).await
         .expect("Songbird Voice client placed in at initialisation.")
         .clone();
 
@@ -126,14 +130,10 @@ pub async fn deafen(ctx: Context<'_>) -> Result<(), Error> {
     let mut handler = handler_lock.lock().await;
 
     if handler.is_deaf() {
-        ctx.send(poise::CreateReply::default()
-            .content("Already deafened")
-            .ephemeral(true)).await?;
+        ctx.send(poise::CreateReply::default().content("Already deafened").ephemeral(true)).await?;
     } else {
         handler.deafen(true).await?;
-        ctx.send(poise::CreateReply::default()
-            .content("Deafened")
-            .ephemeral(true)).await?;
+        ctx.send(poise::CreateReply::default().content("Deafened").ephemeral(true)).await?;
     }
 
     Ok(())
@@ -144,7 +144,8 @@ pub async fn deafen(ctx: Context<'_>) -> Result<(), Error> {
 pub async fn undeafen(ctx: Context<'_>) -> Result<(), Error> {
     let guild_id = ctx.guild_id().ok_or("Not in a guild")?;
 
-    let manager = songbird::get(ctx.serenity_context()).await
+    let manager = songbird
+        ::get(ctx.serenity_context()).await
         .expect("Songbird Voice client placed in at initialisation.")
         .clone();
 
@@ -152,9 +153,7 @@ pub async fn undeafen(ctx: Context<'_>) -> Result<(), Error> {
     let mut handler = handler_lock.lock().await;
 
     handler.deafen(false).await?;
-    ctx.send(poise::CreateReply::default()
-        .content("Undeafened")
-        .ephemeral(true)).await?;
+    ctx.send(poise::CreateReply::default().content("Undeafened").ephemeral(true)).await?;
 
     Ok(())
 }
@@ -164,7 +163,8 @@ pub async fn undeafen(ctx: Context<'_>) -> Result<(), Error> {
 pub async fn mute(ctx: Context<'_>) -> Result<(), Error> {
     let guild_id = ctx.guild_id().ok_or("Not in a guild")?;
 
-    let manager = songbird::get(ctx.serenity_context()).await
+    let manager = songbird
+        ::get(ctx.serenity_context()).await
         .expect("Songbird Voice client placed in at initialisation.")
         .clone();
 
@@ -172,14 +172,10 @@ pub async fn mute(ctx: Context<'_>) -> Result<(), Error> {
     let mut handler = handler_lock.lock().await;
 
     if handler.is_mute() {
-        ctx.send(poise::CreateReply::default()
-            .content("Already muted")
-            .ephemeral(true)).await?;
+        ctx.send(poise::CreateReply::default().content("Already muted").ephemeral(true)).await?;
     } else {
         handler.mute(true).await?;
-        ctx.send(poise::CreateReply::default()
-            .content("Now muted")
-            .ephemeral(true)).await?;
+        ctx.send(poise::CreateReply::default().content("Now muted").ephemeral(true)).await?;
     }
 
     Ok(())
@@ -190,7 +186,8 @@ pub async fn mute(ctx: Context<'_>) -> Result<(), Error> {
 pub async fn unmute(ctx: Context<'_>) -> Result<(), Error> {
     let guild_id = ctx.guild_id().ok_or("Not in a guild")?;
 
-    let manager = songbird::get(ctx.serenity_context()).await
+    let manager = songbird
+        ::get(ctx.serenity_context()).await
         .expect("Songbird Voice client placed in at initialisation.")
         .clone();
 
@@ -198,9 +195,7 @@ pub async fn unmute(ctx: Context<'_>) -> Result<(), Error> {
     let mut handler = handler_lock.lock().await;
 
     handler.mute(false).await?;
-    ctx.send(poise::CreateReply::default()
-        .content("Unmuted")
-        .ephemeral(true)).await?;
+    ctx.send(poise::CreateReply::default().content("Unmuted").ephemeral(true)).await?;
 
     Ok(())
 }
@@ -208,9 +203,7 @@ pub async fn unmute(ctx: Context<'_>) -> Result<(), Error> {
 /// Ping the bot
 #[poise::command(slash_command)]
 pub async fn ping(ctx: Context<'_>) -> Result<(), Error> {
-    ctx.send(poise::CreateReply::default()
-        .content("Pong!")
-        .ephemeral(true)).await?;
+    ctx.send(poise::CreateReply::default().content("Pong!").ephemeral(true)).await?;
     Ok(())
 }
 
@@ -218,24 +211,24 @@ pub async fn ping(ctx: Context<'_>) -> Result<(), Error> {
 #[poise::command(slash_command, guild_only)]
 pub async fn volume(
     ctx: Context<'_>,
-    #[description = "Volume level (0.0 to 2.0, default 1.0)"]
-    #[min = 0.0]
-    #[max = 2.0]
-    level: f32,
+    #[description = "Volume level (0.0 to 2.0, default 1.0)"] #[min = 0.0] #[max = 2.0] level: f32
 ) -> Result<(), Error> {
     let data_read = ctx.serenity_context().data.read().await;
     let (_, discord_buffer) = data_read
         .get::<crate::ListenerHolder>()
         .ok_or("Audio handlers not found")?
         .clone();
-    
+
     let mut lock = discord_buffer.lock().await;
     lock.set_global_volume(level);
-    
-    ctx.send(poise::CreateReply::default()
-        .content(format!("🔊 Volume set to: {:.0}%", level * 100.0))
-        .ephemeral(true)).await?;
-    
+
+    ctx.send(
+        poise::CreateReply
+            ::default()
+            .content(format!("🔊 Volume set to: {:.0}%", level * 100.0))
+            .ephemeral(true)
+    ).await?;
+
     Ok(())
 }
 
@@ -247,13 +240,13 @@ pub async fn reset_audio(ctx: Context<'_>) -> Result<(), Error> {
         .get::<crate::ListenerHolder>()
         .ok_or("Audio handlers not found")?
         .clone();
-    
+
     let mut lock = discord_buffer.lock().await;
     lock.reset();
-    
-    ctx.send(poise::CreateReply::default()
-        .content("🔄 Audio queues reset!")
-        .ephemeral(true)).await?;
+
+    ctx.send(
+        poise::CreateReply::default().content("🔄 Audio queues reset!").ephemeral(true)
+    ).await?;
     Ok(())
 }
 
@@ -265,14 +258,17 @@ pub async fn volume_check(ctx: Context<'_>) -> Result<(), Error> {
         .get::<crate::ListenerHolder>()
         .ok_or("Audio handlers not found")?
         .clone();
-    
+
     let lock = discord_buffer.lock().await;
     let current = lock.get_global_volume();
-    
-    ctx.send(poise::CreateReply::default()
-        .content(format!("🔊 Current volume: {:.0}%", current * 100.0))
-        .ephemeral(true)).await?;
-    
+
+    ctx.send(
+        poise::CreateReply
+            ::default()
+            .content(format!("🔊 Current volume: {:.0}%", current * 100.0))
+            .ephemeral(true)
+    ).await?;
+
     Ok(())
 }
 
@@ -341,7 +337,11 @@ impl VoiceEventHandler for Receiver {
                 for (&ssrc, voice_data) in &tick.speaking {
                     if let Some(audio) = &voice_data.decoded_voice {
                         if audio.len() > 0 {
-                            tracing::debug!("Voice tick for SSRC {}: {} samples", ssrc, audio.len());
+                            tracing::debug!(
+                                "Voice tick for SSRC {}: {} samples",
+                                ssrc,
+                                audio.len()
+                            );
                         }
                     }
                 }

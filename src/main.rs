@@ -222,20 +222,20 @@ async fn main() -> Result<()> {
         ::default_provider()
         .install_default()
         .expect("Failed to install rustls crypto provider");
-    
+
     if std::env::var(RUST_LOG).is_err() {
         std::env::set_var(
             RUST_LOG,
             #[cfg(debug_assertions)] "info,voice_bridge=debug",
-            #[cfg(not(debug_assertions))] "warn,voice_bridge=info"
+            #[cfg(not(debug_assertions))] "error,tsclientlib=error,songbird=error,voice_bridge=info"
         );
     }
     tracing_subscriber::fmt::init();
-    
+
     let config: Config = toml
         ::from_str(&std::fs::read_to_string(".credentials.toml").expect("No config file!"))
         .expect("Invalid config");
-    
+
     let logger = {
         let decorator = slog_term::TermDecorator::new().build();
         let drain = slog_term::CompactFormat::new(decorator).build().fuse();
@@ -245,7 +245,8 @@ async fn main() -> Result<()> {
     };
 
     // Create Poise framework
-    let framework = poise::Framework::builder()
+    let framework = poise::Framework
+        ::builder()
         .options(poise::FrameworkOptions {
             commands: vec![
                 discord::join(),
@@ -257,7 +258,7 @@ async fn main() -> Result<()> {
                 discord::ping(),
                 discord::volume(),
                 discord::volume_check(),
-                discord::reset_audio(),
+                discord::reset_audio()
             ],
             ..Default::default()
         })
@@ -271,6 +272,9 @@ async fn main() -> Result<()> {
 
     let songbird = Songbird::serenity();
     songbird.set_config(DriverConfig::default().decode_mode(songbird::driver::DecodeMode::Decode));
+
+    // Store songbird manager for graceful shutdown
+    let songbird_manager_shutdown = songbird.clone();
 
     let intents =
         GatewayIntents::GUILD_MESSAGES |
@@ -290,7 +294,7 @@ async fn main() -> Result<()> {
     let mut handler = discord_audiohandler::AudioHandler::new(discord_voice_logger);
     handler.set_global_volume(config.volume);
     let discord_voice_buffer: AudioBufferDiscord = Arc::new(Mutex::new(handler));
-    
+
     {
         let mut data = client.data.write().await;
         data.insert::<ListenerHolder>((
@@ -368,7 +372,7 @@ async fn main() -> Result<()> {
             }
             Ok(())
         });
-        
+
         tokio::select! {
             _send = interval.tick() => {
                 let start = std::time::Instant::now();
@@ -380,18 +384,35 @@ async fn main() -> Result<()> {
                     }
                 }
             }
-            _ = tokio::signal::ctrl_c() => { break; }
+            _ = tokio::signal::ctrl_c() => { 
+                println!("Received shutdown signal...");
+                break; 
+            }
             r = events => {
                 r?;
                 bail!("Disconnected");
             }
         }
     }
-    
-    println!("Disconnecting");
+
+    // Graceful shutdown
+    println!("Disconnecting from Discord voice channels...");
+    let guild_ids: Vec<_> = songbird_manager_shutdown
+        .iter()
+        .map(|(guild_id, _)| guild_id)
+        .collect();
+
+    for guild_id in guild_ids {
+        println!("  Leaving guild {}...", guild_id);
+        if let Err(e) = songbird_manager_shutdown.remove(guild_id).await {
+            eprintln!("  Error leaving guild {}: {:?}", guild_id, e);
+        }
+    }
+
+    println!("Disconnecting from TeamSpeak...");
     con.disconnect(DisconnectOptions::new())?;
     con.events().for_each(|_| future::ready(())).await;
-    println!("Disconnected");
+    println!("Shutdown complete!");
     Ok(())
 }
 
@@ -406,7 +427,7 @@ async fn process_discord_audio(
     }
     let mut encoded = [0; MAX_OPUS_FRAME_SIZE];
     let encoder_c = encoder.clone();
-    
+
     let res = task
         ::spawn_blocking(move || {
             let start = std::time::Instant::now();
@@ -418,12 +439,12 @@ async fn process_discord_audio(
                 }
                 Ok(size) => size,
             };
-            
+
             let duration = start.elapsed().as_millis();
             if duration > 2 {
                 tracing::warn!("Took too {}ms for processing audio!", duration);
             }
-            
+
             Some(
                 OutAudio::new(
                     &(AudioData::C2S {
